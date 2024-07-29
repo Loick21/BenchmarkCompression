@@ -1,0 +1,6 @@
+com\zunix\convert\Main.class
+com\zunix\convert\StreamConverter.class
+com\zunix\convert\TwoThreadStreamConverter.class
+com\zunix\convert\SimpleStreamConverter.class
+com\zunix\convert\TwoThreadStreamConverter$ByteProducer.class
+com\zunix\convert\TwoThreadStreamConverter$ByteConsumer.class
