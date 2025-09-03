@@ -1,9 +1,10 @@
-// javac --add-modules jdk.incubator.vector JsonArrayToJsonLinesStreamingSIMD.java
-// java  --add-modules jdk.incubator.vector JsonArrayToJsonLinesStreamingSIMD
+// javac --add-modules jdk.incubator.vector JsonArrayToJsonLinesIterator.java
+// java  --add-modules jdk.incubator.vector JsonArrayToJsonLinesIterator
 import java.io.*;
+import java.util.*;
 import jdk.incubator.vector.*;
 
-public final class JsonArrayToJsonLinesStreamingSIMD {
+public final class JsonArrayToJsonLinesIterator {
 
     private static final byte QUOTE  = (byte) '"';
     private static final byte BSLASH = (byte) '\\';
@@ -26,112 +27,145 @@ public final class JsonArrayToJsonLinesStreamingSIMD {
     }
 
     /**
-     * Streaming JSON array → JSON Lines (with SIMD skip).
+     * Return an Iterable over byte[] elements (JSON Lines).
      */
-    public static byte[] arrayToJsonLines(InputStream in) throws IOException {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+    public static Iterable<byte[]> parseJsonArray(InputStream in) {
+        return () -> new Iterator<>() {
+            final int BUFSZ = 8192;
+            final byte[] buf = new byte[BUFSZ];
+            int read = 0, pos = 0;
 
-        final int BUFSZ = 8192;
-        byte[] buf = new byte[BUFSZ];
+            boolean inString = false;
+            int depth = 0;
+            boolean seenArrayStart = false;
+            boolean done = false;
 
-        boolean inString = false;
-        int depth = 0;
-        boolean seenArrayStart = false;
-        boolean done = false;
+            ByteArrayOutputStream elem = new ByteArrayOutputStream();
 
-        ByteArrayOutputStream elem = new ByteArrayOutputStream();
+            byte[] nextElem = null;
 
-        int read;
-        while (!done && (read = in.read(buf)) != -1) {
-            int p = 0;
-            while (p < read) {
-                if (!seenArrayStart) {
-                    while (p < read && isWs(buf[p])) p++;
-                    if (p < read && buf[p] == LBRACK) {
-                        seenArrayStart = true;
-                        p++;
-                        continue;
-                    }
-                    if (p < read) throw new IllegalArgumentException("Expected '[' at start");
-                    break;
+            @Override
+            public boolean hasNext() {
+                if (nextElem != null) return true;
+                try {
+                    fetchNext();
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
                 }
+                return nextElem != null;
+            }
 
-                if (inString) {
-                    // find next " or end of buffer
-                    int next = nextInteresting(buf, p, read);
-                    if (next < 0) next = read;
-                    while (p < next) elem.write(buf[p++]); // bulk copy boring bytes
-                    if (p >= read) break;
-                    byte c = buf[p++];
-                    elem.write(c);
-                    if (c == QUOTE) {
-                        int backslashes = countBackslashes(elem);
-                        if ((backslashes & 1) == 0) inString = false;
+            @Override
+            public byte[] next() {
+                if (!hasNext()) throw new NoSuchElementException();
+                byte[] res = nextElem;
+                nextElem = null;
+                return res;
+            }
+
+            private void fetchNext() throws IOException {
+                if (done) return;
+
+                while (true) {
+                    if (pos >= read) {
+                        read = in.read(buf);
+                        pos = 0;
+                        if (read == -1) {
+                            if (!done) throw new IllegalArgumentException("Unexpected EOF");
+                            return;
+                        }
                     }
-                    continue;
-                }
+                    int p = pos;
+                    while (p < read) {
+                        if (!seenArrayStart) {
+                            while (p < read && isWs(buf[p])) p++;
+                            if (p < read && buf[p] == LBRACK) {
+                                seenArrayStart = true;
+                                p++;
+                                continue;
+                            }
+                            if (p < read) throw new IllegalArgumentException("Expected '[' at start");
+                            break;
+                        }
 
-                // outside string
-                int next = nextInteresting(buf, p, read);
-                if (next < 0) next = read;
-                while (p < next) {
-                    byte c = buf[p++];
-                    if (!isWs(c) || elem.size() > 0) {
+                        if (inString) {
+                            int next = nextInteresting(buf, p, read);
+                            if (next < 0) next = read;
+                            elem.write(buf, p, next - p);
+                            p = next;
+                            if (p >= read) break;
+                            byte c = buf[p++];
+                            elem.write(c);
+                            if (c == QUOTE) {
+                                int bs = countBackslashes(elem);
+                                if ((bs & 1) == 0) inString = false;
+                            }
+                            continue;
+                        }
+
+                        int next = nextInteresting(buf, p, read);
+                        if (next < 0) next = read;
+                        while (p < next) {
+                            byte c = buf[p++];
+                            if (!isWs(c) || elem.size() > 0) elem.write(c);
+                        }
+                        if (p >= read) break;
+
+                        byte c = buf[p++];
+                        if (c == QUOTE) {
+                            inString = true;
+                            elem.write(c);
+                            continue;
+                        }
+                        if (c == LBRACE || c == LBRACK) {
+                            depth++;
+                            elem.write(c);
+                            continue;
+                        }
+                        if (c == RBRACE || c == RBRACK) {
+                            if (c == RBRACK && depth == 0) {
+                                nextElem = finalizeElem(elem);
+                                done = true;
+                                pos = p;
+                                return;
+                            }
+                            depth--;
+                            elem.write(c);
+                            continue;
+                        }
+                        if (c == COMMA && depth == 0) {
+                            nextElem = finalizeElem(elem);
+                            pos = p;
+                            return;
+                        }
                         elem.write(c);
                     }
+                    pos = p;
                 }
-                if (p >= read) break;
-
-                byte c = buf[p++];
-                if (c == QUOTE) {
-                    inString = true;
-                    elem.write(c);
-                    continue;
-                }
-                if (c == LBRACE || c == LBRACK) {
-                    depth++;
-                    elem.write(c);
-                    continue;
-                }
-                if (c == RBRACE || c == RBRACK) {
-                    if (c == RBRACK && depth == 0) {
-                        flushElem(out, elem);
-                        done = true;
-                        continue;
-                    }
-                    depth--;
-                    elem.write(c);
-                    continue;
-                }
-                if (c == COMMA && depth == 0) {
-                    flushElem(out, elem);
-                    continue;
-                }
-                elem.write(c);
             }
-        }
-
-        if (!done) throw new IllegalArgumentException("Unexpected EOF (no closing ']')");
-        return out.toByteArray();
+        };
     }
 
     /* ---- helpers ---- */
 
-    private static void flushElem(ByteArrayOutputStream out, ByteArrayOutputStream elem) throws IOException {
+    private static byte[] finalizeElem(ByteArrayOutputStream elem) {
         byte[] arr = elem.toByteArray();
         int from = 0, to = arr.length;
         while (from < to && isWs(arr[from])) from++;
         while (to > from && isWs(arr[to - 1])) to--;
-        if (to > from) {
-            out.write(arr, from, to - from);
-            out.write(NL);
-        }
         elem.reset();
+        if (to > from) {
+            byte[] out = new byte[to - from + 1];
+            System.arraycopy(arr, from, out, 0, to - from);
+            out[out.length - 1] = NL;
+            return out;
+        }
+        return null; // empty
     }
 
     private static int countBackslashes(ByteArrayOutputStream elem) {
         byte[] arr = elem.toByteArray();
-        int i = arr.length - 2; // check chars before last written
+        int i = arr.length - 2;
         int count = 0;
         while (i >= 0 && arr[i] == BSLASH) {
             count++;
@@ -140,7 +174,6 @@ public final class JsonArrayToJsonLinesStreamingSIMD {
         return count;
     }
 
-    // SIMD search for next "interesting" char
     private static int nextInteresting(byte[] a, int pos, int end) {
         int i = pos;
         int upper = end - (end - i) % S.length();
@@ -167,7 +200,9 @@ public final class JsonArrayToJsonLinesStreamingSIMD {
     public static void main(String[] args) throws Exception {
         String json = "[{\"a\":1}, 2, \"x,y\", [3,4], null, {\"s\":\"a\\\"b\\\\c\"}]";
         InputStream in = new ByteArrayInputStream(json.getBytes());
-        byte[] result = arrayToJsonLines(in);
-        System.out.write(result);
+
+        for (byte[] elem : parseJsonArray(in)) {
+            System.out.write(elem);
+        }
     }
 }
